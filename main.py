@@ -36,8 +36,8 @@ def _normalize_date(s: Optional[str]) -> Optional[str]:
     try:
         ts = pd.to_datetime(s, utc=False, errors="raise")
         return ts.isoformat()
-    except Exception:
-        raise HTTPException(status_code=400, detail=f"Invalid date format: {s}")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid date format: {s}. Error: {str(e)}")
 
 def _load_df() -> pd.DataFrame:
     if not os.path.exists(DATA_PATH):
