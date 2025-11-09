@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, Dict, Tuple
 
-DATA_PATH = os.getenv("DATA_PATH", "/mnt/data/q-fastapi-timeseries-cache.csv")
+DATA_PATH = "q-fastapi-timeseries-cache.csv"
 
 app = FastAPI(title="SmartFactory IoT Stats API", version="1.0.0")
 
