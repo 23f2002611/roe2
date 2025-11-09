@@ -1,16 +1,62 @@
-
-import os
 import pandas as pd
-from fastapi import FastAPI, Query, Response, HTTPException
+import functools
+from fastapi import FastAPI, Request, Response, Query
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import Optional, Dict, Tuple
+from typing import Optional
 
-DATA_PATH = "q-fastapi-timeseries-cache.csv"
+# --- Constants ---
+CSV_FILE = "q-fastapi-timeseries-cache.csv"
 
-app = FastAPI(title="SmartFactory IoT Stats API", version="1.0.0")
+# --- Load Data Once ---
+try:
+    df = pd.read_csv(CSV_FILE)
+    df['timestamp'] = pd.to_datetime(df['timestamp'])
+    print(f"Successfully loaded and parsed {CSV_FILE}.")
+except FileNotFoundError:
+    print(f"Error: {CSV_FILE} not found. Please download it from the exam page.")
+    exit()
 
-# Enable CORS for all origins
+# --- Caching Helper Function ---
+@functools.lru_cache(maxsize=128)
+def get_stats(location: Optional[str], sensor: Optional[str], 
+              start_date: Optional[str], end_date: Optional[str]):
+    """
+    Performs the data filtering and aggregation.
+    This function's results will be cached.
+    """
+    filtered_df = df.copy()
+    
+    if location:
+        filtered_df = filtered_df[filtered_df['location'] == location]
+    if sensor:
+        filtered_df = filtered_df[filtered_df['sensor'] == sensor]
+    if start_date:
+        filtered_df = filtered_df[filtered_df['timestamp'] >= pd.to_datetime(start_date)]
+    if end_date:
+        # Add 1 day to end_date to make it inclusive
+        end_dt = pd.to_datetime(end_date) + pd.Timedelta(days=1)
+        filtered_df = filtered_df[filtered_df['timestamp'] < end_dt]
+
+    count = len(filtered_df)
+    
+    if count == 0:
+        return {"count": 0, "avg": 0, "min": 0, "max": 0}
+
+    avg_val = filtered_df['value'].mean()
+    min_val = filtered_df['value'].min()
+    max_val = filtered_df['value'].max()
+
+    return {
+        "count": int(count),
+        "avg": round(avg_val, 2),
+        "min": round(min_val, 2),
+        "max": round(max_val, 2)
+    }
+
+# --- FastAPI App ---
+app = FastAPI(title="IoT Sensor Analytics API")
+
+# Enable CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -19,112 +65,42 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# In-memory cache for computed stats
-# Key: (location, sensor, start_iso, end_iso)
-_stats_cache: Dict[Tuple[Optional[str], Optional[str], Optional[str], Optional[str]], Dict] = {}
+# Add Private Network header for local testing
+@app.middleware("http")
+async def add_pna_header(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["Access-Control-Allow-Private-Network"] = "true"
+    return response
 
-def _normalize_str(s: Optional[str]) -> Optional[str]:
-    if s is None:
-        return None
-    s2 = s.strip()
-    if s2 == "":
-        return None
-    return s2.lower()
-
-def _normalize_date(s: Optional[str]) -> Optional[str]:
-    if s is None or s.strip() == "":
-        return None
-    try:
-        ts = pd.to_datetime(s, utc=False, errors="raise")
-        return ts.isoformat()
-    except Exception:
-        raise HTTPException(status_code=400, detail=f"Invalid date format: {s}")
-
-def _load_df() -> pd.DataFrame:
-    if not os.path.exists(DATA_PATH):
-        raise HTTPException(status_code=500, detail=f"Data file not found at {DATA_PATH}")
-    try:
-        df = pd.read_csv(DATA_PATH, parse_dates=["timestamp"])
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to load CSV: {e}")
-    if "location" in df.columns:
-        df["location_norm"] = df["location"].astype(str).str.strip().str.lower()
-    else:
-        raise HTTPException(status_code=500, detail="CSV missing 'location' column")
-    if "sensor" in df.columns:
-        df["sensor_norm"] = df["sensor"].astype(str).str.strip().str.lower()
-    else:
-        raise HTTPException(status_code=500, detail="CSV missing 'sensor' column")
-    if "value" not in df.columns:
-        raise HTTPException(status_code=500, detail="CSV missing 'value' column")
-    df["value"] = pd.to_numeric(df["value"], errors="coerce")
-    df = df.dropna(subset=["value", "timestamp"])
-    return df
-
-_df_cache = None
-_df_mtime = None
-
-def _get_df() -> pd.DataFrame:
-    global _df_cache, _df_mtime
-    try:
-        mtime = os.path.getmtime(DATA_PATH)
-    except FileNotFoundError:
-        raise HTTPException(status_code=500, detail=f"Data file not found at {DATA_PATH}")
-    if _df_cache is None or _df_mtime != mtime:
-        _df_cache = _load_df()
-        _df_mtime = mtime
-    return _df_cache
-
-class StatsResponse(BaseModel):
-    stats: dict
-
-@app.get("/stats", response_model=StatsResponse)
-def stats(
+# --- API Endpoint ---
+@app.get("/stats")
+async def stats_endpoint(
     response: Response,
-    location: Optional[str] = Query(None, description="Location filter (e.g., zone-c)"),
-    sensor: Optional[str] = Query(None, description="Sensor type (e.g., temperature)"),
-    start_date: Optional[str] = Query(None, description="Start ISO date/time (e.g., 2025-01-01)"),
-    end_date: Optional[str] = Query(None, description="End ISO date/time (e.g., 2025-12-31)"),
+    location: Optional[str] = Query(None),
+    sensor: Optional[str] = Query(None),
+    start_date: Optional[str] = Query(None),
+    end_date: Optional[str] = Query(None)
 ):
-    df = _get_df()
+    """
+    Analyzes sensor data with filters and response caching.
+    """
+    # Get cache info before the call
+    cache_info_before = get_stats.cache_info()
+    
+    # Call the cached function
+    stats_data = get_stats(location, sensor, start_date, end_date)
+    
+    # Get cache info after the call
+    cache_info_after = get_stats.cache_info()
 
-    loc_norm = _normalize_str(location)
-    sen_norm = _normalize_str(sensor)
-    start_iso = _normalize_date(start_date) if start_date else None
-    end_iso = _normalize_date(end_date) if end_date else None
-
-    cache_key = (loc_norm, sen_norm, start_iso, end_iso)
-
-    if cache_key in _stats_cache:
-        result = _stats_cache[cache_key]
+    # Set X-Cache header
+    if cache_info_after.hits > cache_info_before.hits:
         response.headers["X-Cache"] = "HIT"
-        return {"stats": result}
-
-    filtered = df
-    if loc_norm is not None:
-        filtered = filtered[filtered["location_norm"] == loc_norm]
-    if sen_norm is not None:
-        filtered = filtered[filtered["sensor_norm"] == sen_norm]
-    if start_iso is not None:
-        start_ts = pd.to_datetime(start_iso)
-        filtered = filtered[filtered["timestamp"] >= start_ts]
-    if end_iso is not None:
-        end_ts = pd.to_datetime(end_iso)
-        filtered = filtered[filtered["timestamp"] <= end_ts]
-
-    if filtered.empty:
-        result = {"count": 0, "avg": None, "min": None, "max": None}
-        _stats_cache[cache_key] = result
+    else:
         response.headers["X-Cache"] = "MISS"
-        return {"stats": result}
 
-    vals = filtered["value"].astype(float)
-    result = {
-        "count": int(vals.count()),
-        "avg": float(vals.mean()),
-        "min": float(vals.min()),
-        "max": float(vals.max()),
-    }
-    _stats_cache[cache_key] = result
-    response.headers["X-Cache"] = "MISS"
-    return {"stats": result}
+    return {"stats": stats_data}
+
+@app.get("/")
+def read_root():
+    return {"message": "API is running. Use the /stats endpoint."}
